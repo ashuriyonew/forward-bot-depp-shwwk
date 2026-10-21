@@ -1,15 +1,13 @@
 import asyncio
 import logging
-import json
 import os
-from typing import Optional
+import re
+from threading import Thread
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import (
-    FloodWait, ChatForwardsRestricted, MessageIdInvalid,
-    ChannelInvalid, ChatWriteForbidden,
-)
+from pyrogram.errors import FloodWait, ChatForwardsRestricted, MessageIdInvalid
 from pyrogram.enums import ParseMode
 
 logging.basicConfig(
@@ -22,434 +20,246 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
+PORT = int(os.environ.get("PORT", 10000))
 
-CONFIG_FILE = "config_data.json"
-
-# ---------------- CONFIG PERSISTENCE ----------------
-def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def save_config(data: dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-CFG = load_config()
-
-def cfg_get(key, default=None):
-    return CFG.get(key, default)
-
-def cfg_set(key, value):
-    CFG[key] = value
-    save_config(CFG)
-
+# Temporary per-user memory (multi-step input)
+USER_STATE = {}
 
 app = Client(
     "forward_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100,
+    workers=50,
     sleep_threshold=10,
 )
 
-# ---------------- STATE ----------------
-STATE = {
-    "running": False,
-    "stop": False,
-    "live": False,
-    "forwarded": 0,
-    "failed": 0,
-    "skipped": 0,
-    "total": 0,
-    "current_id": 0,
-    "status_msg_id": None,
-    "status_chat_id": None,
-}
+# ---------------- DUMMY WEB SERVER (Render free plan ke liye) ----------------
+class Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK - bot running")
+
+    def log_message(self, *args):
+        pass
+
+def run_web():
+    server = HTTPServer(("0.0.0.0", PORT), Ping)
+    log.info(f"Dummy web server listening on {PORT}")
+    server.serve_forever()
 
 
-def topic_kwargs(topic_id):
-    try:
-        tid = int(topic_id or 0)
-    except Exception:
-        tid = 0
-    return {"reply_to_message_id": tid} if tid > 0 else {}
+# ---------------- LINK PARSER ----------------
+# Supported:
+#   https://t.me/c/4421160772/715/724-792
+#   https://t.me/c/4421160772/715
+#   https://t.me/c/4421160772/715/724
+#   https://t.me/c/4421160772/724-792
+# Returns: (chat_id, topic_id, first_id, last_id)
+def parse_link(link: str):
+    # t.me/c/<internal_id>/[topic/]<first>[-<last>]
+    m = re.match(
+        r"https?://t\.me/c/(\d+)(?:/(\d+))?(?:/(\d+)(?:-(\d+))?)?",
+        link.strip()
+    )
+    if not m:
+        # private channel alt format
+        m2 = re.match(
+            r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?(?:/(\d+)(?:-(\d+))?)?",
+            link.strip()
+        )
+        if not m2:
+            return None
+        username = m2.group(1)
+        topic = int(m2.group(2)) if m2.group(2) else 0
+        first = int(m2.group(3)) if m2.group(3) else 1
+        last = int(m2.group(4)) if m2.group(4) else first
+        return (username, topic, first, last)
+
+    internal = int(m.group(1))
+    chat_id = int(f"-100{internal}")
+
+    # Ambiguous: group(2) could be topic, group(3) could be msg or topic
+    a = m.group(2)
+    b = m.group(3)
+    c = m.group(4)
+
+    if b is None and c is None:
+        # /c/ID/715  → 715 could be msg_id or topic
+        # assume 715 is message id, no topic
+        topic = 0
+        first = int(a) if a else 1
+        last = first
+    elif c is None:
+        # /c/ID/715/724  → topic=715, msg=724
+        topic = int(a)
+        first = int(b)
+        last = int(b)
+    else:
+        # /c/ID/715/724-792  → topic=715, first=724, last=792
+        topic = int(a)
+        first = int(b)
+        last = int(c)
+
+    return (chat_id, topic, first, last)
 
 
 # ---------------- CORE FORWARD ----------------
-async def forward_single(client, chat_id, message_id, retries=3) -> bool:
-    """Ek single message forward. FloodWait / restricted handle."""
-    dest_chat = cfg_get("dest_chat")
-    dest_topic = cfg_get("dest_topic", 0)
-    if not dest_chat:
-        return False
-
+async def forward_one(chat_id, msg_id, dest_chat, dest_topic, retries=3):
     for attempt in range(retries):
         try:
-            await client.forward_messages(
-                chat_id=int(dest_chat),
-                from_chat_id=int(chat_id),
-                message_ids=message_id,
-                **topic_kwargs(dest_topic),
+            await app.forward_messages(
+                chat_id=dest_chat,
+                from_chat_id=chat_id,
+                message_ids=msg_id,
+                **({"reply_to_message_id": dest_topic} if dest_topic else {})
             )
             return True
         except FloodWait as e:
-            wait = e.value + 2
-            log.warning(f"FloodWait {wait}s — sleeping")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(e.value + 2)
             continue
         except ChatForwardsRestricted:
-            # fallback copy
             try:
-                await client.copy_message(
-                    chat_id=int(dest_chat),
-                    from_chat_id=int(chat_id),
-                    message_id=message_id,
-                    **topic_kwargs(dest_topic),
+                await app.copy_message(
+                    chat_id=dest_chat,
+                    from_chat_id=chat_id,
+                    message_id=msg_id,
+                    **({"reply_to_message_id": dest_topic} if dest_topic else {})
                 )
                 return True
-            except Exception as ce:
-                log.error(f"Copy fallback fail {message_id}: {ce}")
+            except Exception:
                 return False
-        except (MessageIdInvalid, ChannelInvalid):
-            log.warning(f"Msg {message_id} invalid/deleted — skip")
-            return False
-        except ChatWriteForbidden:
-            log.error("Dest me post permission nahi — Admin banao.")
+        except MessageIdInvalid:
             return False
         except Exception as e:
-            log.error(f"Forward fail {message_id} attempt {attempt+1}: {e}")
-            await asyncio.sleep(1.5)
+            log.error(f"fail {msg_id}: {e}")
+            await asyncio.sleep(1)
     return False
 
 
-async def update_status(text: str):
-    sid = STATE.get("status_msg_id")
-    cid = STATE.get("status_chat_id")
-    if sid and cid:
-        try:
-            await app.edit_message_text(cid, sid, text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
-
-
-# ---------------- HELP ----------------
-HELP_TEXT = """
-**🤖 Advanced Range Forward Bot**
-
-**Setup:**
-• `/setsource <chat_id>` — source group/channel
-• `/setdest <chat_id>` — destination
-• `/setsrctopic <id>` — source topic (0 = none)
-• `/setdesttopic <id>` — dest topic (0 = none)
-• `/setdelay <sec>` — delay (default 0.5)
-• `/config` — settings dekho
-
-**Range Forward (main feature):**
-• `/forward <first_id> <last_id>` — first se last tak **sequence wise har single message**
-  Example: `/forward 100 500`
-
-**Live mode:**
-• `/live` — naya message aate hi forward
-• `/liveoff`
-• `/stop` — sab stop
-• `/status`
-
-**Note:** Range forward me message ID order strictly maintain hoga (100 → 500). Delete hue IDs skip honge automatically.
-"""
-
-
+# ---------------- COMMANDS ----------------
 @app.on_message(filters.command("start") & filters.user(OWNER_ID))
 async def cmd_start(client, message: Message):
-    await message.reply(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    await message.reply(
+        "**🤖 Forward Bot**\n\n"
+        "1️⃣ `/set <target_chat_id>` — dest group/channel ID\n"
+        "2️⃣ `/forward <t.me link>` — source link\n\n"
+        "**Link example:**\n"
+        "`https://t.me/c/4421160772/715/724-792`\n\n"
+        "Bot strictly `724` → `792` tak **sequence wise** forward karega.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
-@app.on_message(filters.command("help") & filters.user(OWNER_ID))
-async def cmd_help(client, message: Message):
-    await message.reply(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
-
-
-# ---------------- SET COMMANDS ----------------
-@app.on_message(filters.command("setsource") & filters.user(OWNER_ID))
-async def cmd_setsource(client, message: Message):
+@app.on_message(filters.command("set") & filters.user(OWNER_ID))
+async def cmd_set(client, message: Message):
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply("Usage: `/setsource -1001234567890`", parse_mode=ParseMode.MARKDOWN)
+        return await message.reply("Usage: `/set -1001234567890`", parse_mode=ParseMode.MARKDOWN)
     try:
-        chat_id = int(args[1])
-        chat = await client.get_chat(chat_id)
-    except Exception as e:
-        return await message.reply(f"❌ `{e}`\nPehle bot ko us chat me add karo.", parse_mode=ParseMode.MARKDOWN)
-    cfg_set("source_chat", chat_id)
-    await message.reply(f"✅ Source: **{chat.title or chat_id}**\n`{chat_id}`", parse_mode=ParseMode.MARKDOWN)
-
-
-@app.on_message(filters.command("setdest") & filters.user(OWNER_ID))
-async def cmd_setdest(client, message: Message):
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply("Usage: `/setdest -1009876543210`", parse_mode=ParseMode.MARKDOWN)
-    try:
-        chat_id = int(args[1])
-        chat = await client.get_chat(chat_id)
+        cid = int(args[1])
+        chat = await client.get_chat(cid)
     except Exception as e:
         return await message.reply(f"❌ `{e}`\nBot ko dest me Admin banao.", parse_mode=ParseMode.MARKDOWN)
-    cfg_set("dest_chat", chat_id)
-    await message.reply(f"✅ Dest: **{chat.title or chat_id}**\n`{chat_id}`", parse_mode=ParseMode.MARKDOWN)
+    USER_STATE.setdefault(message.from_user.id, {})["dest"] = cid
+    USER_STATE[message.from_user.id]["dest_topic"] = 0
+    await message.reply(f"✅ Target set: **{chat.title or cid}**\n`{cid}`", parse_mode=ParseMode.MARKDOWN)
 
 
-@app.on_message(filters.command("setsrctopic") & filters.user(OWNER_ID))
-async def cmd_setsrctopic(client, message: Message):
+@app.on_message(filters.command("settopic") & filters.user(OWNER_ID))
+async def cmd_settopic(client, message: Message):
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply("Usage: `/setsrctopic 12` (0=none)")
+        return await message.reply("Usage: `/settopic 45` (0 = none)")
     try:
         tid = int(args[1])
     except ValueError:
         return await message.reply("❌ Invalid topic id.")
-    cfg_set("source_topic", tid)
-    await message.reply(f"✅ Source topic: `{tid}`")
-
-
-@app.on_message(filters.command("setdesttopic") & filters.user(OWNER_ID))
-async def cmd_setdesttopic(client, message: Message):
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply("Usage: `/setdesttopic 45` (0=none)")
-    try:
-        tid = int(args[1])
-    except ValueError:
-        return await message.reply("❌ Invalid topic id.")
-    cfg_set("dest_topic", tid)
+    USER_STATE.setdefault(message.from_user.id, {})["dest_topic"] = tid
     await message.reply(f"✅ Dest topic: `{tid}`")
 
 
-@app.on_message(filters.command("setdelay") & filters.user(OWNER_ID))
-async def cmd_setdelay(client, message: Message):
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply("Usage: `/setdelay 0.5`")
-    try:
-        d = float(args[1])
-        if d < 0:
-            raise ValueError
-    except ValueError:
-        return await message.reply("❌ Invalid delay.")
-    cfg_set("delay", d)
-    await message.reply(f"✅ Delay: `{d}s`")
-
-
-@app.on_message(filters.command("config") & filters.user(OWNER_ID))
-async def cmd_config(client, message: Message):
-    await message.reply(
-        "**⚙️ Config**\n\n"
-        f"Source: `{cfg_get('source_chat', 'Not set')}`\n"
-        f"Dest: `{cfg_get('dest_chat', 'Not set')}`\n"
-        f"Source Topic: `{cfg_get('source_topic', 0)}`\n"
-        f"Dest Topic: `{cfg_get('dest_topic', 0)}`\n"
-        f"Delay: `{cfg_get('delay', 0.5)}s`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ---------------- STATUS / STOP ----------------
-@app.on_message(filters.command("status") & filters.user(OWNER_ID))
-async def cmd_status(client, message: Message):
-    await message.reply(
-        f"**📊 Status**\n"
-        f"Running: `{STATE['running']}`\n"
-        f"Live: `{STATE['live']}`\n"
-        f"Current ID: `{STATE['current_id']}`\n"
-        f"Forwarded: `{STATE['forwarded']}`\n"
-        f"Failed: `{STATE['failed']}`\n"
-        f"Skipped: `{STATE['skipped']}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-@app.on_message(filters.command("stop") & filters.user(OWNER_ID))
-async def cmd_stop(client, message: Message):
-    STATE["stop"] = True
-    STATE["running"] = False
-    STATE["live"] = False
-    await message.reply("🛑 Stopped.")
-
-
-# ---------------- MAIN: RANGE FORWARD ----------------
 @app.on_message(filters.command("forward") & filters.user(OWNER_ID))
-async def cmd_forward_range(client, message: Message):
-    """
-    /forward <first_id> <last_id>
-    Strict sequence: first → last. Har single message.
-    """
-    args = message.text.split()
-    if len(args) != 3:
+async def cmd_forward(client, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
         return await message.reply(
-            "**Usage:** `/forward <first_msg_id> <last_msg_id>`\n"
-            "Example: `/forward 100 500`",
+            "Usage: `/forward https://t.me/c/4421160772/715/724-792`",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    try:
-        first_id = int(args[1])
-        last_id = int(args[2])
-    except ValueError:
-        return await message.reply("❌ IDs integer hone chahiye.")
+    user_state = USER_STATE.get(message.from_user.id, {})
+    dest_chat = user_state.get("dest")
+    dest_topic = user_state.get("dest_topic", 0)
 
-    if first_id <= 0 or last_id <= 0 or last_id < first_id:
-        return await message.reply("❌ Invalid range. Ensure: `first_id < last_id` both > 0.")
+    if not dest_chat:
+        return await message.reply("❌ Pehle `/set <target_id>` karo.", parse_mode=ParseMode.MARKDOWN)
 
-    source_chat = cfg_get("source_chat")
-    dest_chat = cfg_get("dest_chat")
-    if not source_chat or not dest_chat:
-        return await message.reply("❌ Pehle `/setsource` aur `/setdest` karo.", parse_mode=ParseMode.MARKDOWN)
+    parsed = parse_link(args[1].strip())
+    if not parsed:
+        return await message.reply("❌ Invalid link format.")
 
-    if STATE["running"]:
-        return await message.reply("⚠️ Already running. `/stop` karo pehle.")
+    chat_id, topic, first_id, last_id = parsed
 
-    # init state
-    STATE.update({
-        "running": True,
-        "stop": False,
-        "forwarded": 0,
-        "failed": 0,
-        "skipped": 0,
-        "total": last_id - first_id + 1,
-        "current_id": first_id,
-        "status_chat_id": message.chat.id,
-    })
+    if last_id < first_id:
+        return await message.reply("❌ Last ID < First ID. Check link.")
 
     status = await message.reply(
-        f"🚀 **Range Forward Started**\n"
+        f"🚀 **Started**\n"
+        f"Source: `{chat_id}`" + (f" (topic `{topic}`)" if topic else "") + "\n"
         f"Range: `{first_id}` → `{last_id}`\n"
-        f"Total: `{STATE['total']}` messages\n"
-        f"Sequence: strict\n\n"
-        f"`Progress: 0/{STATE['total']}`",
+        f"Total: `{last_id - first_id + 1}`\n"
+        f"Dest: `{dest_chat}`" + (f" (topic `{dest_topic}`)" if dest_topic else ""),
         parse_mode=ParseMode.MARKDOWN,
     )
-    STATE["status_msg_id"] = status.id
 
-    delay = float(cfg_get("delay", 0.5))
-    src_topic = int(cfg_get("source_topic", 0))
-    source_chat_int = int(source_chat)
-
-    processed = 0
+    ok = fail = skipped = 0
     last_update = 0
+    processed = 0
 
-    try:
-        # STRICT SEQUENCE LOOP: first_id → last_id, ek ek karke
-        for msg_id in range(first_id, last_id + 1):
-            if STATE["stop"]:
-                await update_status("🛑 **Stopped by user.**")
-                break
+    # STRICT SEQUENCE: first → last
+    for msg_id in range(first_id, last_id + 1):
+        success = await forward_one(chat_id, msg_id, dest_chat, dest_topic)
+        if success:
+            ok += 1
+        else:
+            skipped += 1
+        processed += 1
 
-            STATE["current_id"] = msg_id
-
-            # Source topic filter ke liye pehle try: agar topic set hai to
-            # forwarded message ka thread check karna padega — lekin direct forward se
-            # topic match verify nahi hota. Isliye hum get_messages se verify karte hain.
-            if src_topic > 0:
-                try:
-                    fetched = await client.get_messages(source_chat_int, msg_id)
-                    if not fetched or fetched.empty:
-                        STATE["skipped"] += 1
-                        processed += 1
-                        continue
-                    thread_id = getattr(fetched, "message_thread_id", None) or \
-                                (fetched.reply_to_message.id if fetched.reply_to_message else None)
-                    if thread_id != src_topic:
-                        STATE["skipped"] += 1
-                        processed += 1
-                        continue
-                except Exception:
-                    STATE["skipped"] += 1
-                    processed += 1
-                    continue
-
-            ok = await forward_single(client, source_chat_int, msg_id)
-            if ok:
-                STATE["forwarded"] += 1
-            else:
-                # Agar message delete hai to failed nahi, skipped me daalo
-                STATE["skipped"] += 1
-
-            processed += 1
-
-            # Har 20 messages pe status update
-            if processed - last_update >= 20:
-                last_update = processed
-                await update_status(
-                    f"🚀 **Range Forward Running**\n"
-                    f"Range: `{first_id}` → `{last_id}`\n"
-                    f"Current: `{msg_id}`\n"
-                    f"`{processed}/{STATE['total']}`\n"
-                    f"✅ OK: `{STATE['forwarded']}`  ⏭ Skip: `{STATE['skipped']}`"
+        if processed - last_update >= 20:
+            last_update = processed
+            try:
+                await status.edit_text(
+                    f"🚀 Running...\n"
+                    f"`{processed}/{last_id - first_id + 1}`\n"
+                    f"✅ {ok}  ⏭ {skipped}"
                 )
+            except Exception:
+                pass
 
-            await asyncio.sleep(delay)
+        await asyncio.sleep(0.3)
 
-        # final report
-        if not STATE["stop"]:
-            await update_status(
-                f"✅ **Forward Complete**\n"
-                f"Range: `{first_id}` → `{last_id}`\n"
-                f"Total: `{STATE['total']}`\n"
-                f"✅ Forwarded: `{STATE['forwarded']}`\n"
-                f"⏭ Skipped: `{STATE['skipped']}`\n"
-                f"❌ Failed: `{STATE['failed']}`"
-            )
-    except Exception as e:
-        log.exception("Range forward error")
-        await update_status(f"❌ **Error:** `{e}`")
-    finally:
-        STATE["running"] = False
+    await status.edit_text(
+        f"✅ **Done**\n"
+        f"Range: `{first_id}` → `{last_id}`\n"
+        f"✅ Forwarded: `{ok}`\n"
+        f"⏭ Skipped: `{skipped}`"
+    )
 
 
-# ---------------- LIVE MODE ----------------
-@app.on_message(filters.command("live") & filters.user(OWNER_ID))
-async def cmd_live_on(client, message: Message):
-    if not cfg_get("source_chat") or not cfg_get("dest_chat"):
-        return await message.reply("❌ Pehle source/dest set karo.")
-    STATE["live"] = True
-    await message.reply("🔴 **Live ON** — source ka har naya message forward hoga.")
+@app.on_message(filters.command("status") & filters.user(OWNER_ID))
+async def cmd_status(client, message: Message):
+    u = USER_STATE.get(message.from_user.id, {})
+    await message.reply(
+        f"**⚙️ Settings**\n"
+        f"Target: `{u.get('dest', 'Not set')}`\n"
+        f"Dest topic: `{u.get('dest_topic', 0)}`"
+    )
 
 
-@app.on_message(filters.command("liveoff") & filters.user(OWNER_ID))
-async def cmd_live_off(client, message: Message):
-    STATE["live"] = False
-    await message.reply("⚪ Live OFF.")
-
-
-@app.on_message(filters.group | filters.channel, group=99)
-async def live_forward(client, message: Message):
-    if not STATE["live"]:
-        return
-    source = cfg_get("source_chat")
-    if not source or message.chat.id != int(source):
-        return
-    if getattr(message, "service", None):
-        return
-
-    src_topic = int(cfg_get("source_topic", 0))
-    if src_topic > 0:
-        thread_id = getattr(message, "message_thread_id", None) or \
-                    (message.reply_to_message.id if message.reply_to_message else None)
-        if thread_id != src_topic:
-            return
-
-    ok = await forward_single(client, message.chat.id, message.id)
-    if ok:
-        STATE["forwarded"] += 1
-    else:
-        STATE["skipped"] += 1
-
-    await asyncio.sleep(float(cfg_get("delay", 0.5)))
-
-
-log.info("Starting Advanced Range Forward Bot...")
-app.run()
+# ---------------- START ----------------
+if __name__ == "__main__":
+    Thread(target=run_web, daemon=True).start()
+    log.info("Starting bot...")
+    app.run()
